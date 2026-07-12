@@ -59,6 +59,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hops", type=int, default=2, help="Propagation hops")
     parser.add_argument("--curated-mutations", default="data/curated_mutations.json", help="Curated NDM mutation file")
     parser.add_argument("--curated-zero-indexed", action="store_true", help="Curated positions are zero-indexed")
+    parser.add_argument(
+        "--scorer",
+        choices=["egnn", "gbsp"],
+        default="egnn",
+        help=(
+            "Method for the 'graph' score (default: egnn): a small E(n)-"
+            "equivariant GNN ensemble (see egnn_model.py). 'gbsp' = original "
+            "fixed alpha/hops propagation baseline, kept for comparison."
+        ),
+    )
+    parser.add_argument("--egnn-hidden", type=int, default=32, help="EGNN hidden dimension (default: 32)")
+    parser.add_argument("--egnn-layers", type=int, default=2, help="Number of EGNN layers (default: 2)")
+    parser.add_argument("--egnn-models", type=int, default=5, help="Ensemble size (default: 5)")
+    parser.add_argument("--egnn-epochs", type=int, default=300, help="Max training epochs per model (default: 300)")
     return parser.parse_args()
 
 
@@ -180,6 +194,43 @@ def propagate_scores(initial: np.ndarray, adj_norm: np.ndarray, alpha: float, ho
     return (propagated - propagated.min()) / (propagated.max() - propagated.min() + 1e-8)
 
 
+_DEFAULT_EGNN_CONFIG = {
+    "n_models": 5,
+    "hidden_dim": 32,
+    "n_layers": 2,
+    "dropout": 0.3,
+    "epochs": 300,
+    "patience": 30,
+    "lr": 1e-2,
+    "weight_decay": 1e-3,
+    "update_coords": False,
+    "seed": 0,
+    "device": "cpu",
+}
+
+
+def compute_variant_frequency(reference_seq: str, records: Sequence[SuperfamilyRecord]) -> np.ndarray:
+    """Fraction of `records` (excluding a sequence identical to the
+    reference) carrying a substitution at each reference position --
+    EGNN's regression target. This script has no held-out test split (it
+    scores the full superfamily against itself), so this is computed over
+    all `records`, mirroring how `variance` is computed in `family_summary`.
+    """
+    n_residues = len(reference_seq)
+    variant_counts = np.zeros(n_residues, dtype=np.float32)
+    n_compared = 0
+    for rec in records:
+        if rec.sequence == reference_seq:
+            continue
+        n_compared += 1
+        for pos in project_variant_positions(reference_seq, rec.sequence):
+            if 0 <= pos < n_residues:
+                variant_counts[pos] += 1
+    if n_compared == 0:
+        return np.zeros(n_residues, dtype=np.float32)
+    return variant_counts / n_compared
+
+
 def embed_sequences(
     records: Sequence[SuperfamilyRecord],
     device: str,
@@ -245,6 +296,8 @@ def family_summary(
     reference: Optional[SuperfamilyRecord],
     alpha: float,
     hops: int,
+    scorer: str = "egnn",
+    egnn_config: Optional[Dict] = None,
 ) -> Dict[str, float]:
     fam_records = [r for r in records if r.family == family]
     if not fam_records or reference is None:
@@ -275,7 +328,7 @@ def family_summary(
             variance[idx] = np.var(stack, axis=0).mean()
 
     var_norm = (variance - variance.min()) / (variance.max() - variance.min() + 1e-8)
-    propagated = propagate_scores(var_norm, build_chain_graph(n_residues), alpha=alpha, hops=hops)
+    adj_norm = build_chain_graph(n_residues)
 
     if family == NDM_FAMILY:
         active_positions = np.array([119, 121, 123, 188, 207, 249], dtype=int)
@@ -283,18 +336,39 @@ def family_summary(
         active_positions = np.array([max(0, n_residues // 3), max(0, n_residues // 2)], dtype=int)
     dist = np.array([min(abs(i - a) for a in active_positions) for i in range(n_residues)], dtype=np.float32)
     biophysical = (dist - dist.min()) / (dist.max() - dist.min() + 1e-8)
+
+    if scorer == "egnn":
+        from egnn_model import build_edge_index_from_adjacency, straight_chain_coords, train_egnn_ensemble
+
+        edge_index = build_edge_index_from_adjacency(adj_norm)
+        coords = straight_chain_coords(n_residues)
+        position_frac = np.arange(n_residues, dtype=np.float32) / max(1, n_residues - 1)
+        node_features = np.stack([var_norm, biophysical, position_frac], axis=1)
+        target = np.clip(compute_variant_frequency(ref_seq, fam_records), 0.0, 1.0)
+
+        cfg = dict(_DEFAULT_EGNN_CONFIG)
+        if egnn_config:
+            cfg.update(egnn_config)
+        propagated = train_egnn_ensemble(
+            node_features=node_features,
+            coords=coords,
+            edge_index=edge_index,
+            target=target,
+            **cfg,
+        )
+    else:
+        propagated = propagate_scores(var_norm, adj_norm, alpha=alpha, hops=hops)
+
     combined = 0.80 * propagated + 0.20 * biophysical
 
-    if family == NDM_FAMILY:
-        positive_positions = sorted({p for rec in fam_records if rec.header != reference.header for p in project_variant_positions(ref_seq, rec.sequence)})
-    else:
-        positive_positions = sorted({p for rec in fam_records if rec.header != reference.header for p in project_variant_positions(ref_seq, rec.sequence)})
+    positive_positions = sorted({p for rec in fam_records if rec.header != reference.header for p in project_variant_positions(ref_seq, rec.sequence)})
 
     y_true = np.array([1 if i in positive_positions else 0 for i in range(n_residues)], dtype=int)
     from sklearn.metrics import roc_auc_score
 
     metrics = {
         "family": family,
+        "scorer": scorer,
         "reference": reference.header,
         "n_sequences": len(fam_records),
         "n_positive_positions": int(y_true.sum()),
@@ -359,9 +433,24 @@ def main() -> int:
     curated_map = load_curated_mutations(args.curated_mutations, args.curated_zero_indexed)
     family_refs = {fam: choose_reference(records, fam) for fam in [NDM_FAMILY, VIM_FAMILY, IMP_FAMILY]}
 
+    print(f"[Scorer] {args.scorer}"
+          + (f" (hidden={args.egnn_hidden}, layers={args.egnn_layers}, ensemble={args.egnn_models})"
+             if args.scorer == "egnn" else ""))
+
+    egnn_config = {
+        "n_models": args.egnn_models,
+        "hidden_dim": args.egnn_hidden,
+        "n_layers": args.egnn_layers,
+        "epochs": args.egnn_epochs,
+        "device": device,
+    }
+
     summaries: List[Dict[str, object]] = []
     for fam in [NDM_FAMILY, VIM_FAMILY, IMP_FAMILY]:
-        summary = family_summary(records, embeddings, fam, family_refs[fam], alpha=args.alpha, hops=args.hops)
+        summary = family_summary(
+            records, embeddings, fam, family_refs[fam], alpha=args.alpha, hops=args.hops,
+            scorer=args.scorer, egnn_config=egnn_config,
+        )
         summary["analysis_level"] = "full_superfamily"
         summary["label_type"] = "observed_variant_positions"
         summaries.append(summary)
