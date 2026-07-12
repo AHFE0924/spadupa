@@ -1,5 +1,4 @@
-
-This project predicts mutation-tolerant positions in B1 metallo-beta-lactamases using ESM-2 embeddings and graph-based propagation.
+This project predicts mutation-tolerant positions in B1 metallo-beta-lactamases using ESM-2 embeddings and graph-based scoring: a small trained E(n)-equivariant GNN (EGNN, default) or the original fixed-weight graph propagation (GBSP).
 
 ## Superfamily data expansion
 Fetch B1 MBL sequences from UniProt and cluster at 40% identity:
@@ -9,11 +8,16 @@ python scripts/fetch_b1_superfamily.py --output data/b1_superfamily.fasta --clus
 ```
 
 ## GroupKFold evaluation (no leakage)
-Run GroupKFold CV with ROC/PR curves and mean/std AUC:
+Run GroupKFold CV with ROC/PR curves and mean/std AUC. Scores with EGNN by default; pass `--scorer gbsp` to run the original zero-parameter propagation baseline instead, for direct comparison:
 
 ```bash
 python scripts/groupkfold_cv.py --input data/b1_filtered.fasta --family VIM --identity 0.4 --cluster-method auto --output output/groupkfold --device cuda --folds 5
+
+# original GBSP baseline, for comparison
+python scripts/groupkfold_cv.py --input data/b1_filtered.fasta --family VIM --identity 0.4 --cluster-method auto --output output/groupkfold --device cuda --folds 5 --scorer gbsp
 ```
+
+See `scripts/egnn_model.py` for the EGNN architecture and `--egnn-*` flags in `--help` for hyperparameters (hidden dim, layers, ensemble size, epochs, etc).
 
 ## In silico mutational heatmap
 Generate all single amino-acid substitutions for a reference sequence:
