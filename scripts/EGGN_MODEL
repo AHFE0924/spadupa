@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""E(n)-Equivariant Graph Neural Network (Satorras, Hoogeboom & Welling, 2021)
+for per-residue mutation-tolerance scoring.
+
+Replaces the fixed-weight graph diffusion in `propagate_scores` (GBSP) with a
+small, trainable, rotation/translation-equivariant message-passing network.
+Node features come from ESM-2-derived signals + biophysical priors; geometry
+comes from real (PDB) or chain-fallback Cα coordinates.
+
+Why equivariant, and why small
+------------------------------
+`_run_pipeline.py::AdvancedGNN` (a GAT+GCN hybrid) was already tried as a
+supervised classifier on the ~10 curated NDM-1 resistance positions and
+scored ROC-AUC ~0.5 -- no better than random. Baking in E(3) symmetry
+(the score can't depend on how the input structure happens to be translated
+or rotated) shrinks the hypothesis space the model has to search, which is
+the standard motivation for equivariant architectures in low-data structural
+problems -- but symmetry alone does not eliminate the small-N risk. So this
+module also:
+
+  1. Trains on a TRAIN-FOLD-ONLY soft regression target (fraction of
+     training homologs that carry a substitution at each position -- see
+     `compute_train_variant_frequency` in groupkfold_cv.py), never on the
+     curated/held-out labels used for evaluation.
+  2. Keeps the network small (2 layers, 32 hidden units by default).
+  3. Trains a small ensemble with dropout + weight decay + early stopping
+     and averages predictions -- the same regularization recipe used by
+     the (unused) `_run_pipeline.py::GNNTrainer`, just applied to an
+     equivariant backbone and a less-sparse training signal.
+
+No torch_geometric dependency -- plain torch tensor ops (`index_add_`) only,
+so this runs anywhere torch does (Kaggle T4, CPU, laptop).
+"""
+from __future__ import annotations
+
+from typing import Optional
+
+import numpy as np
+
+try:
+    import torch
+    import torch.nn as nn
+
+    TORCH_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    TORCH_AVAILABLE = False
+
+
+def set_seed(seed: int) -> None:
+    np.random.seed(seed)
+    if TORCH_AVAILABLE:
+        torch.manual_seed(seed)
+
+
+def build_edge_index_from_adjacency(adj: np.ndarray, drop_self_loops: bool = True) -> np.ndarray:
+    """Dense (N,N) adjacency -> (2,E) edge index for EGNN's message passing.
+
+    Reuses whatever adjacency `build_structure_graph` / `build_chain_graph`
+    already produced elsewhere in this codebase, so EGNN sees exactly the
+    same connectivity GBSP did -- only the message function differs.
+    """
+    src, dst = np.nonzero(adj)
+    if drop_self_loops:
+        mask = src != dst
+        src, dst = src[mask], dst[mask]
+    return np.stack([src, dst], axis=0).astype(np.int64)
+
+
+def straight_chain_coords(n_residues: int, bond_length: float = 3.8) -> np.ndarray:
+    """Fallback virtual coordinates: residues placed on a straight line
+    spaced by the mean Cα-Cα bond length (3.8 Å). Used when no crystal
+    structure is available at all -- carries the same "sequence-adjacency
+    only" information the ±5 chain-graph fallback already relies on, no
+    invented long-range 3D contacts.
+    """
+    coords = np.zeros((n_residues, 3), dtype=np.float32)
+    coords[:, 0] = np.arange(n_residues, dtype=np.float32) * bond_length
+    return coords
+
+
+if TORCH_AVAILABLE:
+
+    class EGNNLayer(nn.Module):
+        """One E(n)-equivariant layer (Satorras et al. 2021, eqs. 3-6).
+
+        Messages condition on the squared Euclidean distance between nodes
+        (invariant to translation/rotation of the input structure), not on
+        raw coordinates -- this is what makes the resulting node features
+        equivariant rather than dependent on how the structure is posed.
+        """
+
+        def __init__(
+            self,
+            feat_dim: int,
+            hidden_dim: int,
+            dropout: float = 0.2,
+            update_coords: bool = False,
+        ):
+            super().__init__()
+            self.update_coords = update_coords
+            self.edge_mlp = nn.Sequential(
+                nn.Linear(feat_dim * 2 + 1, hidden_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+            )
+            self.node_mlp = nn.Sequential(
+                nn.Linear(feat_dim + hidden_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, feat_dim),
+            )
+            if update_coords:
+                self.coord_mlp = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.SiLU(),
+                    nn.Linear(hidden_dim, 1, bias=False),
+                )
+
+        def forward(self, h: "torch.Tensor", x: "torch.Tensor", edge_index: "torch.Tensor"):
+            row, col = edge_index[0], edge_index[1]
+            rel = x[row] - x[col]                              # (E, 3)
+            dist2 = (rel ** 2).sum(-1, keepdim=True)            # (E, 1) invariant
+            m_ij = self.edge_mlp(torch.cat([h[row], h[col], dist2], dim=-1))
+
+            agg = torch.zeros(h.shape[0], m_ij.shape[1], dtype=h.dtype, device=h.device)
+            agg.index_add_(0, row, m_ij)                       # sum_{j in N(i)} m_ij
+
+            h_new = h + self.node_mlp(torch.cat([h, agg], dim=-1))  # residual update
+
+            x_new = x
+            if self.update_coords:
+                w = self.coord_mlp(m_ij)                        # (E, 1)
+                delta = rel * w
+                agg_x = torch.zeros_like(x)
+                agg_x.index_add_(0, row, delta)
+                deg = torch.zeros(x.shape[0], 1, dtype=x.dtype, device=x.device)
+                deg.index_add_(0, row, torch.ones_like(w))
+                x_new = x + agg_x / (deg + 1e-8)
+            return h_new, x_new
+
+    class EGNN(nn.Module):
+        """Stack of EGNN layers + scalar readout head (per-node logit)."""
+
+        def __init__(
+            self,
+            in_dim: int,
+            hidden_dim: int = 32,
+            n_layers: int = 2,
+            dropout: float = 0.3,
+            update_coords: bool = False,
+        ):
+            super().__init__()
+            self.embed_in = nn.Linear(in_dim, hidden_dim)
+            self.layers = nn.ModuleList(
+                [
+                    EGNNLayer(hidden_dim, hidden_dim, dropout=dropout, update_coords=update_coords)
+                    for _ in range(n_layers)
+                ]
+            )
+            mid = max(hidden_dim // 2, 4)
+            self.readout = nn.Sequential(
+                nn.Linear(hidden_dim, mid),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.Linear(mid, 1),
+            )
+
+        def forward(self, h0, x0, edge_index):
+            h = self.embed_in(h0)
+            x = x0
+            for layer in self.layers:
+                h, x = layer(h, x, edge_index)
+            return self.readout(h).squeeze(-1)  # (N,) raw logits
+
+
+def train_egnn_ensemble(
+    node_features: np.ndarray,
+    coords: np.ndarray,
+    edge_index: np.ndarray,
+    target: np.ndarray,
+    n_models: int = 5,
+    hidden_dim: int = 32,
+    n_layers: int = 2,
+    dropout: float = 0.3,
+    epochs: int = 300,
+    patience: int = 30,
+    lr: float = 1e-2,
+    weight_decay: float = 1e-3,
+    update_coords: bool = False,
+    seed: int = 0,
+    device: str = "cpu",
+) -> np.ndarray:
+    """Train a small ensemble of EGNNs against a continuous [0,1] target and
+    return the mean predicted score per node, min-max normalized to [0,1].
+
+    `target` MUST be derivable from training data only (e.g. fraction of
+    training homologs that vary at each position) -- the caller is
+    responsible for keeping test-fold labels out of this function. Training
+    uses a per-model random split of node POSITIONS (not sequences) purely
+    for early-stopping; message passing still sees the full graph each step
+    (standard transductive GNN training), so this is not a data leak.
+
+    Falls back to returning `target` unchanged (min-max normalized) if
+    torch is unavailable or the target has ~zero variance (a degenerate
+    fold with nothing to learn -- e.g. every train sequence identical).
+    """
+    n_nodes = node_features.shape[0]
+    target = np.nan_to_num(target, nan=0.0).astype(np.float32)
+
+    if not TORCH_AVAILABLE or float(np.std(target)) < 1e-6:
+        span = target.max() - target.min()
+        return (target - target.min()) / (span + 1e-8)
+
+    # Standardize node features using this fold's own statistics only.
+    mu = node_features.mean(axis=0, keepdims=True)
+    sigma = node_features.std(axis=0, keepdims=True) + 1e-8
+    feats_norm = ((node_features - mu) / sigma).astype(np.float32)
+
+    use_cuda = device == "cuda" and torch.cuda.is_available()
+    device_t = torch.device("cuda" if use_cuda else "cpu")
+
+    h0 = torch.tensor(feats_norm, dtype=torch.float32, device=device_t)
+    x0 = torch.tensor(coords, dtype=torch.float32, device=device_t)
+    ei = torch.tensor(edge_index, dtype=torch.long, device=device_t)
+    y = torch.tensor(target, dtype=torch.float32, device=device_t)
+
+    n_val = max(1, int(0.2 * n_nodes))
+    all_preds = []
+
+    for m in range(n_models):
+        set_seed(seed + m)
+        perm = np.random.permutation(n_nodes)
+        val_idx = torch.tensor(perm[:n_val], dtype=torch.long, device=device_t)
+        train_idx = torch.tensor(perm[n_val:], dtype=torch.long, device=device_t)
+
+        model = EGNN(
+            in_dim=feats_norm.shape[1],
+            hidden_dim=hidden_dim,
+            n_layers=n_layers,
+            dropout=dropout,
+            update_coords=update_coords,
+        ).to(device_t)
+        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        loss_fn = nn.BCEWithLogitsLoss()
+
+        best_val = float("inf")
+        best_state = None
+        bad_epochs = 0
+        for _epoch in range(epochs):
+            model.train()
+            opt.zero_grad()
+            logits = model(h0, x0, ei)
+            loss = loss_fn(logits[train_idx], y[train_idx])
+            loss.backward()
+            opt.step()
+
+            model.eval()
+            with torch.no_grad():
+                val_logits = model(h0, x0, ei)
+                val_loss = loss_fn(val_logits[val_idx], y[val_idx]).item()
+
+            if val_loss < best_val - 1e-5:
+                best_val = val_loss
+                best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                bad_epochs = 0
+            else:
+                bad_epochs += 1
+                if bad_epochs >= patience:
+                    break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+        model.eval()
+        with torch.no_grad():
+            preds = torch.sigmoid(model(h0, x0, ei)).cpu().numpy()
+        all_preds.append(preds)
+
+    mean_preds = np.mean(np.stack(all_preds, axis=0), axis=0)
+    span = mean_preds.max() - mean_preds.min()
+    return (mean_preds - mean_preds.min()) / (span + 1e-8)
