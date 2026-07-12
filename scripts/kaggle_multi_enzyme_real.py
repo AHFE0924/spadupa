@@ -5,11 +5,17 @@ This script:
 - loads real ESM-2 embeddings via fair-esm (esm2_t33_650M_UR50D)
 - uses the curated NDM-1 variant set from `_run_pipeline.py`
 - uses VIM/IMP homologs from `data/b1_filtered.fasta`
-- computes 2-hop alpha=0.6 graph propagation
+- scores per-position mutation tolerance via a small trained E(n)-equivariant
+  GNN ensemble by default (--scorer egnn; see egnn_model.py), or the original
+  fixed alpha=0.6, 2-hop graph propagation (--scorer gbsp)
 - reports ROC-AUC for each enzyme/family
 
 For VIM/IMP, ROC-AUC is measured against observed variant positions relative to
 that family's canonical reference sequence in the FASTA.
+
+Note: this script has no train/test split (it scores against the same
+`records` used to build the signal) -- it's the fast Kaggle iteration path.
+The honest, no-leakage evaluation lives in scripts/groupkfold_cv.py.
 """
 from __future__ import annotations
 
@@ -119,6 +125,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Treat curated positions as 0-indexed (default assumes 1-indexed).",
     )
+    parser.add_argument(
+        "--scorer",
+        choices=["egnn", "gbsp"],
+        default="egnn",
+        help=(
+            "Method for the 'graph' score (default: egnn): a small E(n)-"
+            "equivariant GNN ensemble (see egnn_model.py). 'gbsp' = original "
+            "fixed alpha/hops propagation baseline, kept for comparison."
+        ),
+    )
+    parser.add_argument("--egnn-hidden", type=int, default=32, help="EGNN hidden dimension (default: 32)")
+    parser.add_argument("--egnn-layers", type=int, default=2, help="Number of EGNN layers (default: 2)")
+    parser.add_argument("--egnn-models", type=int, default=5, help="Ensemble size (default: 5)")
+    parser.add_argument("--egnn-epochs", type=int, default=300, help="Max training epochs per model (default: 300)")
     return parser.parse_args()
 
 
@@ -323,6 +343,47 @@ def get_observed_variant_positions(reference: FamilyRecord, records: Sequence[Fa
     return sorted(positions)
 
 
+_DEFAULT_EGNN_CONFIG = {
+    "n_models": 5,
+    "hidden_dim": 32,
+    "n_layers": 2,
+    "dropout": 0.3,
+    "epochs": 300,
+    "patience": 30,
+    "lr": 1e-2,
+    "weight_decay": 1e-3,
+    "update_coords": False,
+    "seed": 0,
+    "device": "cpu",
+}
+
+
+def compute_variant_frequency(reference_seq: str, records: Sequence[FamilyRecord]) -> np.ndarray:
+    """Fraction of `records` (excluding a sequence identical to the
+    reference) carrying a substitution at each reference position.
+
+    Used as the EGNN's regression target. This script has no held-out test
+    split -- it scores against the same `records` used to build the signal,
+    consistent with its existing self-evaluation design (a fast Kaggle
+    iteration path; the honest, no-leakage evaluation lives in
+    groupkfold_cv.py) -- so this is computed over all `records`, exactly
+    mirroring how `variance` is computed in `compute_family_scores` below.
+    """
+    n_residues = len(reference_seq)
+    variant_counts = np.zeros(n_residues, dtype=np.float32)
+    n_compared = 0
+    for rec in records:
+        if rec.sequence == reference_seq:
+            continue
+        n_compared += 1
+        for pos in project_variant_positions(reference_seq, rec.sequence):
+            if 0 <= pos < n_residues:
+                variant_counts[pos] += 1
+    if n_compared == 0:
+        return np.zeros(n_residues, dtype=np.float32)
+    return variant_counts / n_compared
+
+
 def evaluate_label_set(scores: Dict[str, np.ndarray], positive_positions: Sequence[int]) -> Tuple[Dict[str, float], np.ndarray]:
     n_residues = len(scores["combined"])
     valid_positions = [p for p in positive_positions if 0 <= p < n_residues]
@@ -353,6 +414,8 @@ def compute_family_scores(
     alpha: float,
     hops: int,
     family: str,
+    scorer: str = "egnn",
+    egnn_config: Optional[Dict] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, np.ndarray]]:
     ref_seq = reference_record.sequence
     n_residues = len(ref_seq)
@@ -377,7 +440,6 @@ def compute_family_scores(
 
     var_norm = (variance - variance.min()) / (variance.max() - variance.min() + 1e-8)
     adj_norm = build_chain_graph(n_residues)
-    propagated = propagate_scores(var_norm, adj_norm, alpha=alpha, hops=hops)
 
     # Mild biophysical prior used in the pipeline: farther from active site is more tolerant.
     if family == NDM_FAMILY:
@@ -386,21 +448,46 @@ def compute_family_scores(
         active_positions = np.array([max(0, n_residues // 3), max(0, n_residues // 2)], dtype=int)
     dist = np.array([min(abs(i - a) for a in active_positions) for i in range(n_residues)], dtype=np.float32)
     biophysical = (dist - dist.min()) / (dist.max() - dist.min() + 1e-8)
-    combined = 0.80 * propagated + 0.20 * biophysical
+
+    if scorer == "egnn":
+        from egnn_model import build_edge_index_from_adjacency, straight_chain_coords, train_egnn_ensemble
+
+        # No PDB fetching in this script -- virtual straight chain (same
+        # sequence-adjacency-only information the chain graph already has).
+        edge_index = build_edge_index_from_adjacency(adj_norm)
+        coords = straight_chain_coords(n_residues)
+        position_frac = np.arange(n_residues, dtype=np.float32) / max(1, n_residues - 1)
+        node_features = np.stack([var_norm, biophysical, position_frac], axis=1)
+        target = np.clip(compute_variant_frequency(ref_seq, records), 0.0, 1.0)
+
+        cfg = dict(_DEFAULT_EGNN_CONFIG)
+        if egnn_config:
+            cfg.update(egnn_config)
+        graph_scores = train_egnn_ensemble(
+            node_features=node_features,
+            coords=coords,
+            edge_index=edge_index,
+            target=target,
+            **cfg,
+        )
+    else:
+        graph_scores = propagate_scores(var_norm, adj_norm, alpha=alpha, hops=hops)
+
+    combined = 0.80 * graph_scores + 0.20 * biophysical
 
     df = pd.DataFrame(
         {
             "position": np.arange(1, n_residues + 1),
             "residue": list(ref_seq),
             "variance": var_norm,
-            "graph": propagated,
+            "graph": graph_scores,
             "combined": combined,
             "biophysical": biophysical,
         }
     )
     scores = {
         "variance": var_norm,
-        "graph": propagated,
+        "graph": graph_scores,
         "combined": combined,
         "biophysical": biophysical,
     }
@@ -423,6 +510,9 @@ def main() -> int:
         device = "cpu"
 
     family_order = [x.strip().upper() for x in args.family_order.split(",") if x.strip()]
+    print(f"[Scorer] {args.scorer}"
+          + (f" (hidden={args.egnn_hidden}, layers={args.egnn_layers}, ensemble={args.egnn_models})"
+             if args.scorer == "egnn" else ""))
 
     # Load curated NDM data from the main pipeline.
     ndm_reference, ndm_known_positions = make_sequence_reference_data()
@@ -521,7 +611,15 @@ def main() -> int:
             print(f"Embeddings computed in {t_embed_end - t_embed_start:.1f}s for {len(missing_records)} sequences")
 
         df, scores = compute_family_scores(
-            reference, records, embeddings, alpha=args.alpha, hops=args.hops, family=family
+            reference, records, embeddings, alpha=args.alpha, hops=args.hops, family=family,
+            scorer=args.scorer,
+            egnn_config={
+                "n_models": args.egnn_models,
+                "hidden_dim": args.egnn_hidden,
+                "n_layers": args.egnn_layers,
+                "epochs": args.egnn_epochs,
+                "device": device,
+            },
         )
 
         if family == NDM_FAMILY:
@@ -542,6 +640,7 @@ def main() -> int:
         summary_rows.append(
             {
                 "family": family,
+                "scorer": args.scorer,
                 "reference": reference.header,
                 "n_sequences": len(records),
                 "label_type": label_type,
@@ -568,6 +667,7 @@ def main() -> int:
             summary_rows.append(
                 {
                     "family": family,
+                    "scorer": args.scorer,
                     "reference": reference.header,
                     "n_sequences": len(records),
                     "label_type": "curated_validated_mutations",
