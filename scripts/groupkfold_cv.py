@@ -5,13 +5,30 @@ Clusters sequences at a specified identity threshold and performs GroupKFold
 splits so sequences from the same cluster never appear in both train and test.
 Outputs mean/std ROC-AUC across folds and plots ROC/PR curves.
 
-Method: Graph-Based Score Propagation (GBSP)
---------------------------------------------
-This is NOT a trained GNN.  There are no learnable parameters.  Instead,
-per-residue ESM-2 embedding variance is computed across training sequences
-and smoothed over a graph via iterative propagation.  A biophysical proximity
-term (distance to known active-site residues, weighted 0.10) biases scores
-toward functionally important regions.
+Method: EGNN (default) or Graph-Based Score Propagation (GBSP, --scorer gbsp)
+------------------------------------------------------------------------------
+Per-residue ESM-2 embedding variance is computed across training sequences,
+then smoothed over a graph to produce the "graph" score. Two ways to do the
+smoothing are available via --scorer:
+
+  * "egnn" (default): a small E(n)-equivariant GNN ensemble (see
+    egnn_model.py) trained per-fold on a TRAIN-FOLD-ONLY soft target
+    (fraction of training homologs that vary at each position -- see
+    compute_train_variant_frequency). Uses real Cα coordinates, so messages
+    are conditioned on actual 3D distance rather than a fixed binary
+    contact/window graph. Has learnable parameters, but is deliberately
+    small + regularized (dropout, weight decay, early stopping, 5-model
+    ensemble) because a prior supervised GAT+GCN attempt
+    (_run_pipeline.py::AdvancedGNN) overfit badly (ROC-AUC ~0.5) with the
+    small label counts available for this task.
+
+  * "gbsp": the original method. NOT a trained model -- zero learnable
+    parameters. Iterative linear propagation (alpha/hops) over a fixed,
+    row-normalized adjacency. Kept for direct comparison against EGNN.
+
+Both feed into the same biophysical proximity term (distance to known
+active-site residues, weighted 0.10 by default) and the same combined-score
+blend, so LR/KNN ablations and CV plumbing are identical either way.
 
 Graph construction (structure-based with chain fallback)
 --------------------------------------------------------
@@ -510,6 +527,55 @@ def build_structure_graph(
     return build_chain_graph(n_residues)
 
 
+def get_structure_coords(
+    n_residues: int,
+    family: str,
+    structure_dir: Optional[Path],
+) -> np.ndarray:
+    """Real Cα coordinates for EGNN's geometric input (shape (n_residues, 3)).
+
+    Mirrors the PDB lookup in `build_structure_graph` above but returns raw
+    coordinates instead of an adjacency matrix -- EGNN needs actual 3D
+    positions, not just a binarized/normalized contact matrix. Residues
+    beyond the resolved structure (or every residue, for families with no
+    deposited structure) are placed on a straight virtual chain at the mean
+    Cα–Cα bond length (3.8 Å), continuing from the last resolved residue's
+    local backbone direction so the transition doesn't kink. This carries
+    the same "sequence-adjacency-only" information the ±5 chain-graph
+    fallback already relies on for those residues -- EGNN doesn't lose
+    anything GBSP had, but also doesn't invent unresolved 3D contacts.
+    """
+    if structure_dir is not None:
+        pdb_id = _FAMILY_PDB.get(family.upper())
+        if pdb_id:
+            pdb_path = fetch_rcsb_pdb(pdb_id, structure_dir)
+            if pdb_path is not None:
+                try:
+                    real_coords = parse_ca_coords(pdb_path)
+                    if len(real_coords) >= 10:
+                        min_len = min(len(real_coords), n_residues)
+                        coords = np.zeros((n_residues, 3), dtype=np.float32)
+                        coords[:min_len] = real_coords[:min_len]
+                        if min_len < n_residues:
+                            if min_len >= 2:
+                                direction = coords[min_len - 1] - coords[min_len - 2]
+                                norm = float(np.linalg.norm(direction))
+                                direction = (
+                                    direction / norm if norm > 1e-6
+                                    else np.array([1.0, 0.0, 0.0], dtype=np.float32)
+                                )
+                            else:
+                                direction = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+                            for i in range(min_len, n_residues):
+                                coords[i] = coords[i - 1] + direction * 3.8
+                        return coords
+                except Exception as exc:
+                    print(f"Warning: coordinate extraction failed for {family} ({exc}). Using virtual chain.")
+
+    from egnn_model import straight_chain_coords
+    return straight_chain_coords(n_residues)
+
+
 def robust_normalize(arr: np.ndarray, lo_pct: float = 1.0, hi_pct: float = 99.0) -> np.ndarray:
     """Normalise to [0,1] using percentile clipping to suppress outlier variance spikes."""
     lo = float(np.percentile(arr, lo_pct))
@@ -609,6 +675,149 @@ def compute_scores_from_train(
     return {
         "variance": var_norm,
         "graph": propagated,
+        "biophysical": biophysical,
+        "combined": combined,
+    }
+
+
+def compute_train_variant_frequency(
+    reference: SeqIO.SeqRecord,
+    train_records: Sequence[SeqIO.SeqRecord],
+) -> np.ndarray:
+    """Fraction of TRAINING homologs (excluding the reference) carrying a
+    genuine substitution at each reference position.
+
+    This is EGNN's regression target. It is computed only from the current
+    fold's training split -- same leakage discipline as `variance` above
+    (which is also train-fold-only) -- so it never touches test-fold
+    sequences. It is a literal sequence-identity signal, distinct from (but
+    complementary to) the ESM-embedding-variance signal used as an input
+    feature: the EGNN learns to predict "how often do homologs actually
+    substitute here" from "how much does the language model's
+    representation change here" + structure + active-site distance.
+    """
+    ref_seq = str(reference.seq)
+    n_residues = len(ref_seq)
+    variant_counts = np.zeros(n_residues, dtype=np.float32)
+    coverage_counts = np.zeros(n_residues, dtype=np.float32)
+    for rec in train_records:
+        if rec.id == reference.id:
+            continue
+        query = str(rec.seq)
+        if alignment_coverage(ref_seq, query) < MIN_ALIGNMENT_COVERAGE:
+            continue
+        mapping = align_reference_to_query(ref_seq, query)
+        for ref_idx, query_idx in mapping.items():
+            if query_idx is None or query_idx >= len(query):
+                continue
+            coverage_counts[ref_idx] += 1
+            if ref_seq[ref_idx] != query[query_idx]:
+                variant_counts[ref_idx] += 1
+    freq = np.divide(
+        variant_counts,
+        coverage_counts,
+        out=np.zeros_like(variant_counts),
+        where=coverage_counts > 0,
+    )
+    return freq
+
+
+_DEFAULT_EGNN_CONFIG = {
+    "n_models": 5,
+    "hidden_dim": 32,
+    "n_layers": 2,
+    "dropout": 0.3,
+    "epochs": 300,
+    "patience": 30,
+    "lr": 1e-2,
+    "weight_decay": 1e-3,
+    "update_coords": False,
+    "seed": 0,
+    "device": "cpu",
+}
+
+
+def compute_scores_from_train_egnn(
+    reference: SeqIO.SeqRecord,
+    train_records: Sequence[SeqIO.SeqRecord],
+    embeddings: Dict[str, np.ndarray],
+    family: str = "VIM",
+    structure_dir: Optional[Path] = None,
+    contact_threshold: float = 8.0,
+    biophysical_weight: float = 0.10,
+    egnn_config: Optional[Dict] = None,
+) -> Dict[str, np.ndarray]:
+    """EGNN replacement for GBSP's propagation step.
+
+    Drop-in replacement for `compute_scores_from_train`: only the "graph"
+    score's computation changes (fixed linear diffusion -> trained E(n)-
+    equivariant message passing). "variance" and "biophysical" are computed
+    identically to GBSP, and "combined" uses the same blend formula, so the
+    LR ablations, KNN baseline, and CV/plotting code downstream keep working
+    unmodified regardless of which scorer produced "graph". See
+    egnn_model.py module docstring for the full rationale.
+    """
+    from egnn_model import build_edge_index_from_adjacency, train_egnn_ensemble
+
+    cfg = dict(_DEFAULT_EGNN_CONFIG)
+    if egnn_config:
+        cfg.update(egnn_config)
+
+    ref_seq = str(reference.seq)
+    n_residues = len(ref_seq)
+
+    # STEP 1: ESM-2 embedding variance -- identical computation to GBSP.
+    per_position_vectors: List[List[np.ndarray]] = [[] for _ in range(n_residues)]
+    for rec in train_records:
+        projected = project_embeddings_to_reference(ref_seq, str(rec.seq), embeddings[rec.id])
+        for pos, vec in projected.items():
+            per_position_vectors[pos].append(vec)
+    variance = np.zeros(n_residues, dtype=np.float32)
+    for idx, vectors in enumerate(per_position_vectors):
+        if len(vectors) >= 2:
+            stack = np.stack(vectors, axis=0)
+            variance[idx] = np.var(stack, axis=0).mean()
+    var_norm = robust_normalize(variance)
+
+    # STEP 2: Structure connectivity (same builder GBSP uses) + real coordinates.
+    adj_norm = build_structure_graph(
+        n_residues, family=family, structure_dir=structure_dir, contact_threshold=contact_threshold,
+    )
+    edge_index = build_edge_index_from_adjacency(adj_norm)
+    coords = get_structure_coords(n_residues, family=family, structure_dir=structure_dir)
+
+    # STEP 3: Biophysical proximity term -- identical computation to GBSP.
+    active_positions = get_active_site_positions(family, ref_seq)
+    if active_positions:
+        dist = np.array(
+            [min(abs(i - a) for a in active_positions) for i in range(n_residues)],
+            dtype=np.float32,
+        )
+    else:
+        dist = np.zeros(n_residues, dtype=np.float32)
+    biophysical = robust_normalize(dist)
+
+    # STEP 4: Node features = [ESM variance, biophysical distance, normalized position].
+    position_frac = np.arange(n_residues, dtype=np.float32) / max(1, n_residues - 1)
+    node_features = np.stack([var_norm, biophysical, position_frac], axis=1)
+
+    # STEP 5: Train-fold-only regression target (zero test-fold leakage).
+    target = compute_train_variant_frequency(reference, train_records)
+    target = np.clip(target, 0.0, 1.0)
+
+    egnn_scores = train_egnn_ensemble(
+        node_features=node_features,
+        coords=coords,
+        edge_index=edge_index,
+        target=target,
+        **cfg,
+    )
+
+    combined = (1.0 - biophysical_weight) * egnn_scores + biophysical_weight * biophysical
+
+    return {
+        "variance": var_norm,
+        "graph": egnn_scores,
         "biophysical": biophysical,
         "combined": combined,
     }
@@ -960,6 +1169,40 @@ def parse_args() -> argparse.Namespace:
             "vs. a naive random split."
         ),
     )
+    parser.add_argument(
+        "--scorer",
+        choices=["egnn", "gbsp"],
+        default="egnn",
+        help=(
+            "Method used to compute the 'graph' score (default: egnn). "
+            "'egnn' trains a small E(n)-equivariant GNN ensemble per fold on "
+            "a train-fold-only proxy target (see egnn_model.py). "
+            "'gbsp' is the original fixed-weight propagation baseline (zero "
+            "learned parameters) -- kept for direct comparison via reruns."
+        ),
+    )
+    parser.add_argument("--egnn-hidden", type=int, default=32, help="EGNN hidden dimension (default: 32)")
+    parser.add_argument("--egnn-layers", type=int, default=2, help="Number of EGNN layers (default: 2)")
+    parser.add_argument("--egnn-models", type=int, default=5, help="Ensemble size (default: 5)")
+    parser.add_argument("--egnn-epochs", type=int, default=300, help="Max training epochs per model (default: 300)")
+    parser.add_argument("--egnn-patience", type=int, default=30, help="Early-stopping patience in epochs (default: 30)")
+    parser.add_argument("--egnn-lr", type=float, default=1e-2, help="EGNN learning rate (default: 0.01)")
+    parser.add_argument("--egnn-weight-decay", type=float, default=1e-3, help="EGNN weight decay (default: 1e-3)")
+    parser.add_argument("--egnn-dropout", type=float, default=0.3, help="EGNN dropout (default: 0.3)")
+    parser.add_argument(
+        "--egnn-update-coords",
+        action="store_true",
+        help=(
+            "Let EGNN refine coordinates across layers (default: off, so scores "
+            "stay a function of the fixed input structure rather than a "
+            "per-fold-drifting one)."
+        ),
+    )
+    parser.add_argument(
+        "--egnn-device",
+        default=None,
+        help="Device for EGNN training (default: same as --device).",
+    )
     return parser.parse_args()
 
 
@@ -1170,6 +1413,12 @@ def main() -> int:
     except Exception:
         device = "cpu"
 
+    egnn_device = args.egnn_device or device
+    method_label = "EGNN" if args.scorer == "egnn" else "GBSP"
+    print(f"[Scorer] {method_label}"
+          + (f" (hidden={args.egnn_hidden}, layers={args.egnn_layers}, "
+             f"ensemble={args.egnn_models}, device={egnn_device})" if args.scorer == "egnn" else ""))
+
     embeddings = embed_sequences(
         records, device=device, batch_size=args.batch_size, cache_path=args.embed_cache
     )
@@ -1202,14 +1451,36 @@ def main() -> int:
         train_records = [reference] + [non_reference[i] for i in train_idx]
         test_records = [non_reference[i] for i in test_idx]
 
-        # GBSP scores
-        scores = compute_scores_from_train(
-            reference, train_records, embeddings,
-            alpha=args.alpha, hops=args.hops, family=family,
-            structure_dir=structure_dir,
-            contact_threshold=args.contact_threshold,
-            biophysical_weight=biophysical_weight,
-        )
+        # Primary scorer: EGNN (default) or GBSP (--scorer gbsp)
+        if args.scorer == "egnn":
+            scores = compute_scores_from_train_egnn(
+                reference, train_records, embeddings,
+                family=family,
+                structure_dir=structure_dir,
+                contact_threshold=args.contact_threshold,
+                biophysical_weight=biophysical_weight,
+                egnn_config={
+                    "n_models": args.egnn_models,
+                    "hidden_dim": args.egnn_hidden,
+                    "n_layers": args.egnn_layers,
+                    "dropout": args.egnn_dropout,
+                    "epochs": args.egnn_epochs,
+                    "patience": args.egnn_patience,
+                    "lr": args.egnn_lr,
+                    "weight_decay": args.egnn_weight_decay,
+                    "update_coords": args.egnn_update_coords,
+                    "seed": fold_idx,
+                    "device": egnn_device,
+                },
+            )
+        else:
+            scores = compute_scores_from_train(
+                reference, train_records, embeddings,
+                alpha=args.alpha, hops=args.hops, family=family,
+                structure_dir=structure_dir,
+                contact_threshold=args.contact_threshold,
+                biophysical_weight=biophysical_weight,
+            )
 
         # KNN baseline (k=1)
         knn_scores = compute_knn_scores(reference, train_records, test_records, embeddings)
@@ -1296,11 +1567,12 @@ def main() -> int:
         fold_rows.append(
             {
                 "fold": fold_idx,
+                "scorer": args.scorer,
                 "n_train": len(train_records),
                 "n_test": len(test_records),
                 "n_positive_positions": int(y_true.sum()),
-                "gbsp_roc_auc": roc_auc_gbsp,
-                "gbsp_pr_auc": ap_gbsp,
+                "primary_roc_auc": roc_auc_gbsp,
+                "primary_pr_auc": ap_gbsp,
                 "knn_roc_auc": roc_auc_knn,
                 "knn_pr_auc": ap_knn,
                 "lr_raw_roc_auc": roc_auc_lr,
@@ -1407,6 +1679,7 @@ def main() -> int:
 
     summary = {
         "family": family,
+        "scorer": args.scorer,
         "split_method": args.split_method,
         "biophysical_weight_used": biophysical_weight,
         "biophysical_weight_source": weight_source,
@@ -1417,17 +1690,17 @@ def main() -> int:
         "max_cluster_size": max_cluster_size,
         "max_cluster_fraction": max_cluster_fraction,
         "n_folds_skipped": len(skipped_fold_reasons),
-        # GBSP
-        "gbsp_mean_roc_auc": mean_auc,
-        "gbsp_std_roc_auc": std_auc,
-        "gbsp_mean_pr_auc": mean_ap,
-        "gbsp_std_pr_auc": std_ap,
-        "gbsp_ci_roc_auc_lower": ci_auc_lower,
-        "gbsp_ci_roc_auc_upper": ci_auc_upper,
-        "gbsp_ci_pr_auc_lower": ci_ap_lower,
-        "gbsp_ci_pr_auc_upper": ci_ap_upper,
-        "gbsp_p_value_roc_auc": p_value_auc,
-        "gbsp_p_value_pr_auc": p_value_ap,
+        # Primary scorer (EGNN by default; GBSP if --scorer gbsp)
+        "primary_mean_roc_auc": mean_auc,
+        "primary_std_roc_auc": std_auc,
+        "primary_mean_pr_auc": mean_ap,
+        "primary_std_pr_auc": std_ap,
+        "primary_ci_roc_auc_lower": ci_auc_lower,
+        "primary_ci_roc_auc_upper": ci_auc_upper,
+        "primary_ci_pr_auc_lower": ci_ap_lower,
+        "primary_ci_pr_auc_upper": ci_ap_upper,
+        "primary_p_value_roc_auc": p_value_auc,
+        "primary_p_value_pr_auc": p_value_ap,
         # KNN baseline
         "knn_mean_roc_auc": mean_auc_knn,
         "knn_std_roc_auc": std_auc_knn,
@@ -1440,7 +1713,7 @@ def main() -> int:
         "lr_raw_std_pr_auc": std_ap_lr,
         "lr_raw_learned_signal_weight": float(mean_lr_raw_weights[0]) if mean_lr_raw_weights is not None else float("nan"),
         "lr_raw_learned_biophysical_weight": float(mean_lr_raw_weights[1]) if mean_lr_raw_weights is not None else float("nan"),
-        # LR baseline B: learned blend of GBSP's exact (post-propagation) ingredients
+        # LR baseline B: learned blend of the primary scorer's exact (post-propagation) ingredients
         "lr_graph_mean_roc_auc": mean_auc_lr_graph,
         "lr_graph_std_roc_auc": std_auc_lr_graph,
         "lr_graph_mean_pr_auc": mean_ap_lr_graph,
@@ -1448,39 +1721,39 @@ def main() -> int:
         "lr_graph_learned_signal_weight": float(mean_lr_graph_weights[0]) if mean_lr_graph_weights is not None else float("nan"),
         "lr_graph_learned_biophysical_weight": float(mean_lr_graph_weights[1]) if mean_lr_graph_weights is not None else float("nan"),
         # Convenience deltas
-        "delta_roc_auc_gbsp_minus_knn": mean_auc - mean_auc_knn,
-        "delta_roc_auc_gbsp_minus_lr_raw": mean_auc - mean_auc_lr,
-        "delta_roc_auc_gbsp_minus_lr_graph": mean_auc - mean_auc_lr_graph,
+        "delta_roc_auc_primary_minus_knn": mean_auc - mean_auc_knn,
+        "delta_roc_auc_primary_minus_lr_raw": mean_auc - mean_auc_lr,
+        "delta_roc_auc_primary_minus_lr_graph": mean_auc - mean_auc_lr_graph,
         "delta_roc_auc_lr_graph_minus_lr_raw": mean_auc_lr_graph - mean_auc_lr,
     }
     pd.DataFrame([summary]).to_csv(output_dir / f"cv_{out_tag}_summary.csv", index=False)
 
     # ------------------------------------------------------------------
-    # Plots: GBSP and KNN side-by-side on the same axes
+    # Plots: primary scorer (EGNN/GBSP) and KNN side-by-side on the same axes
     # ------------------------------------------------------------------
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
 
     for fpr, tpr, auc_val in roc_curves_gbsp:
-        axes[0].plot(fpr, tpr, color="steelblue", alpha=0.35, label=f"GBSP AUC={auc_val:.3f}")
+        axes[0].plot(fpr, tpr, color="steelblue", alpha=0.35, label=f"{method_label} AUC={auc_val:.3f}")
     for fpr, tpr, auc_val in roc_curves_knn:
         axes[0].plot(fpr, tpr, color="tomato", alpha=0.35, linestyle="--", label=f"KNN AUC={auc_val:.3f}")
     axes[0].plot([0, 1], [0, 1], "k--", linewidth=1)
     axes[0].set_xlabel("False Positive Rate")
     axes[0].set_ylabel("True Positive Rate")
     axes[0].set_title(
-        f"ROC  GBSP={mean_auc:.3f}±{std_auc:.3f}  KNN={mean_auc_knn:.3f}±{std_auc_knn:.3f}"
+        f"ROC  {method_label}={mean_auc:.3f}±{std_auc:.3f}  KNN={mean_auc_knn:.3f}±{std_auc_knn:.3f}"
     )
 
     for rec, prec, ap in pr_curves_gbsp:
-        axes[1].plot(rec, prec, color="steelblue", alpha=0.35, label=f"GBSP AP={ap:.3f}")
+        axes[1].plot(rec, prec, color="steelblue", alpha=0.35, label=f"{method_label} AP={ap:.3f}")
     for rec, prec, ap in pr_curves_knn:
         axes[1].plot(rec, prec, color="tomato", alpha=0.35, linestyle="--", label=f"KNN AP={ap:.3f}")
     axes[1].set_xlabel("Recall")
     axes[1].set_ylabel("Precision")
     axes[1].set_title(
-        f"PR  GBSP={mean_ap:.3f}±{std_ap:.3f}  KNN={mean_ap_knn:.3f}±{std_ap_knn:.3f}"
+        f"PR  {method_label}={mean_ap:.3f}±{std_ap:.3f}  KNN={mean_ap_knn:.3f}±{std_ap_knn:.3f}"
     )
 
     for ax in axes:
@@ -1497,22 +1770,22 @@ def main() -> int:
     print(f"Saved fold metrics: {output_dir / f'cv_{out_tag}_folds.csv'}")
     print(f"Saved summary:      {output_dir / f'cv_{out_tag}_summary.csv'}")
     print(f"Saved ROC/PR plot:  {fig_path}")
-    print(f"\n[{family} / {args.split_method}] GBSP     ROC-AUC: {mean_auc:.4f} ± {std_auc:.4f}  "
-          "(propagated graph score, fixed 0.90/0.10 blend)")
+    print(f"\n[{family} / {args.split_method}] {method_label:<8} ROC-AUC: {mean_auc:.4f} ± {std_auc:.4f}  "
+          f"({method_label} graph score, fixed 0.90/0.10 blend)")
     print(f"[{family} / {args.split_method}] KNN      ROC-AUC: {mean_auc_knn:.4f} ± {std_auc_knn:.4f}  "
-          f"(delta vs GBSP={mean_auc - mean_auc_knn:+.4f})")
+          f"(delta vs {method_label}={mean_auc - mean_auc_knn:+.4f})")
     print(f"[{family} / {args.split_method}] LR-raw   ROC-AUC: {mean_auc_lr:.4f} ± {std_auc_lr:.4f}  "
           f"(learned blend of PRE-propagation variance + biophysical; "
-          f"delta vs GBSP={mean_auc - mean_auc_lr:+.4f})")
+          f"delta vs {method_label}={mean_auc - mean_auc_lr:+.4f})")
     print(f"[{family} / {args.split_method}] LR-graph ROC-AUC: {mean_auc_lr_graph:.4f} ± {std_auc_lr_graph:.4f}  "
-          f"(learned blend of GBSP's own POST-propagation graph score + biophysical; "
-          f"delta vs GBSP={mean_auc - mean_auc_lr_graph:+.4f})")
+          f"(learned blend of {method_label}'s own POST-propagation graph score + biophysical; "
+          f"delta vs {method_label}={mean_auc - mean_auc_lr_graph:+.4f})")
     if mean_lr_raw_weights is not None:
         print(f"  LR-raw learned weights:   signal={mean_lr_raw_weights[0]:.2f} / "
-              f"biophysical={mean_lr_raw_weights[1]:.2f}  (vs GBSP's hardcoded N/A / N/A, raw has no fixed blend)")
+              f"biophysical={mean_lr_raw_weights[1]:.2f}  (vs {method_label}'s hardcoded N/A / N/A, raw has no fixed blend)")
     if mean_lr_graph_weights is not None:
         print(f"  LR-graph learned weights: graph={mean_lr_graph_weights[0]:.2f} / "
-              f"biophysical={mean_lr_graph_weights[1]:.2f}  (vs GBSP's hardcoded 0.90 / 0.10)")
+              f"biophysical={mean_lr_graph_weights[1]:.2f}  (vs {method_label}'s hardcoded 0.90 / 0.10)")
 
     # ------------------------------------------------------------------
     # Decision rules (printed, not enforced) -- flags worth acting on
@@ -1535,36 +1808,37 @@ def main() -> int:
               "results for this family/split are unusable as-is. Address the cluster-imbalance "
               "or dataset-size issues above before trusting any number from this run.")
     if not np.isnan(mean_auc_knn) and abs(mean_auc - mean_auc_knn) < 0.02:
-        print("  - |GBSP-KNN| < 0.02: graph propagation adds negligible value over "
+        print(f"  - |{method_label}-KNN| < 0.02: graph scoring adds negligible value over "
               "naive k=1 similarity search for this family.")
     if len(aucs_gbsp) == 1:
-        print("  - Only 1/{} folds produced a usable score: the reported GBSP/KNN ROC-AUC is a "
+        print("  - Only 1/{} folds produced a usable score: the reported {}/KNN ROC-AUC is a "
               "single point estimate, not a mean -- treat std=0.0000 as 'undefined', not "
-              "'perfectly stable'. Do not report this number without that caveat.".format(n_splits))
+              "'perfectly stable'. Do not report this number without that caveat.".format(n_splits, method_label))
 
-    # Isolate whether the FIXED 0.90/0.10 weighting or PROPAGATION ITSELF
-    # is responsible for any GBSP underperformance vs the LR ablations.
+    # Isolate whether the FIXED 0.90/0.10 weighting or the GRAPH SCORE ITSELF
+    # is responsible for any primary-scorer underperformance vs the LR ablations.
     if not np.isnan(mean_auc_lr) and not np.isnan(mean_auc_lr_graph):
         if mean_auc_lr_graph > mean_auc + 0.02 and mean_auc_lr_graph >= mean_auc_lr - 0.02:
             if mean_lr_graph_weights is not None:
-                print(f"  - LR-graph ({mean_auc_lr_graph:.3f}) beats GBSP ({mean_auc:.3f}) and matches/beats "
-                      f"LR-raw ({mean_auc_lr:.3f}): propagation itself is fine -- the hardcoded 0.90/0.10 "
+                print(f"  - LR-graph ({mean_auc_lr_graph:.3f}) beats {method_label} ({mean_auc:.3f}) and matches/beats "
+                      f"LR-raw ({mean_auc_lr:.3f}): the graph score itself is fine -- the hardcoded 0.90/0.10 "
                       "blend weight is the problem. Fix: use the learned weight instead "
                       f"(graph={mean_lr_graph_weights[0]:.2f} / biophysical={mean_lr_graph_weights[1]:.2f}) "
                       "rather than the fixed 0.90/0.10 ratio.")
             else:
-                print(f"  - LR-graph ({mean_auc_lr_graph:.3f}) beats GBSP ({mean_auc:.3f}) and matches/beats "
-                      f"LR-raw ({mean_auc_lr:.3f}): propagation itself is fine -- the hardcoded 0.90/0.10 "
+                print(f"  - LR-graph ({mean_auc_lr_graph:.3f}) beats {method_label} ({mean_auc:.3f}) and matches/beats "
+                      f"LR-raw ({mean_auc_lr:.3f}): the graph score itself is fine -- the hardcoded 0.90/0.10 "
                       "blend weight is the problem. Fix: learn the blend weight instead of hardcoding it.")
         elif mean_auc_lr > mean_auc_lr_graph + 0.02:
             print(f"  - LR-raw ({mean_auc_lr:.3f}) beats LR-graph ({mean_auc_lr_graph:.3f}) even though "
-                  f"both use a LEARNED weight: propagation (alpha={args.alpha:.2f}, hops={args.hops}) "
-                  "is destroying signal regardless of how it's weighted. Fix: lower hops, raise alpha "
-                  "(less smoothing), or try --structure-dir '' to compare against the chain-graph "
-                  "fallback directly.")
+                  f"both use a LEARNED weight: the {method_label} graph score "
+                  + (f"(alpha={args.alpha:.2f}, hops={args.hops}) " if args.scorer == "gbsp" else "")
+                  + "is destroying signal regardless of how it's weighted. Fix: "
+                  + ("lower hops, raise alpha (less smoothing), or " if args.scorer == "gbsp" else "try --egnn-layers 1 or a smaller --egnn-hidden, or ")
+                  + "try --structure-dir '' to compare against the chain-graph fallback directly.")
         elif mean_auc_lr_graph > mean_auc + 0.02:
-            print(f"  - LR-graph ({mean_auc_lr_graph:.3f}) beats GBSP ({mean_auc:.3f}): even using GBSP's "
-                  "own post-propagation signal, a learned blend beats the fixed 0.90/0.10 ratio. "
+            print(f"  - LR-graph ({mean_auc_lr_graph:.3f}) beats {method_label} ({mean_auc:.3f}): even using "
+                  f"{method_label}'s own post-propagation signal, a learned blend beats the fixed 0.90/0.10 ratio. "
                   "Fix: learn the blend weight instead of hardcoding it.")
 
     if args.split_method == "group":
@@ -1575,12 +1849,19 @@ def main() -> int:
         group_summary_path = output_dir / f"cv_{family.lower()}_group_summary.csv"
         if group_summary_path.exists():
             try:
-                group_auc = pd.read_csv(group_summary_path)["gbsp_mean_roc_auc"].iloc[0]
-                if mean_auc - group_auc > 0.10:
-                    print(f"  - random-split AUC ({mean_auc:.3f}) exceeds group-split AUC "
-                          f"({group_auc:.3f}) by >0.10: task difficulty is driven mostly by "
-                          "homology-split strictness, not the method itself. Report both "
-                          "numbers together; don't cite the random-split number alone.")
+                group_df = pd.read_csv(group_summary_path)
+                group_scorer = group_df["scorer"].iloc[0] if "scorer" in group_df.columns else None
+                if group_scorer is not None and group_scorer != args.scorer:
+                    print(f"  - Skipping random-vs-group AUC comparison: the saved group-split summary "
+                          f"was produced with --scorer {group_scorer}, this run used --scorer {args.scorer}. "
+                          f"Rerun --split-method group --scorer {args.scorer} for a like-for-like comparison.")
+                else:
+                    group_auc = group_df["primary_mean_roc_auc"].iloc[0]
+                    if mean_auc - group_auc > 0.10:
+                        print(f"  - random-split AUC ({mean_auc:.3f}) exceeds group-split AUC "
+                              f"({group_auc:.3f}) by >0.10: task difficulty is driven mostly by "
+                              "homology-split strictness, not the method itself. Report both "
+                              "numbers together; don't cite the random-split number alone.")
             except Exception:
                 pass
 
