@@ -45,6 +45,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alpha", type=float, default=0.6, help="Propagation alpha")
     parser.add_argument("--hops", type=int, default=2, help="Propagation hops")
     parser.add_argument("--top-k", type=int, default=30, help="Top-k for recall metric")
+    parser.add_argument(
+        "--scorer",
+        choices=["egnn", "gbsp"],
+        default="egnn",
+        help=(
+            "Method for the 'graph' score (default: egnn): a small E(n)-"
+            "equivariant GNN ensemble (see egnn_model.py). 'gbsp' = original "
+            "fixed alpha/hops propagation baseline, kept for comparison."
+        ),
+    )
+    parser.add_argument("--egnn-hidden", type=int, default=32, help="EGNN hidden dimension (default: 32)")
+    parser.add_argument("--egnn-layers", type=int, default=2, help="Number of EGNN layers (default: 2)")
+    parser.add_argument("--egnn-models", type=int, default=5, help="Ensemble size (default: 5)")
+    parser.add_argument("--egnn-epochs", type=int, default=300, help="Max training epochs per model (default: 300)")
     return parser.parse_args()
 
 
@@ -108,6 +122,46 @@ def propagate_scores(initial: np.ndarray, adj_norm: np.ndarray, alpha: float, ho
     for _ in range(hops):
         propagated = alpha * initial + (1.0 - alpha) * (adj_norm @ propagated)
     return (propagated - propagated.min()) / (propagated.max() - propagated.min() + 1e-8)
+
+
+_DEFAULT_EGNN_CONFIG = {
+    "n_models": 5,
+    "hidden_dim": 32,
+    "n_layers": 2,
+    "dropout": 0.3,
+    "epochs": 300,
+    "patience": 30,
+    "lr": 1e-2,
+    "weight_decay": 1e-3,
+    "update_coords": False,
+    "seed": 0,
+    "device": "cpu",
+}
+
+
+def compute_variant_frequency(reference_seq: str, records: Sequence[SyntheticRecord]) -> np.ndarray:
+    """Fraction of `records` (excluding a sequence identical to the
+    reference) carrying a substitution at each reference position --
+    EGNN's regression target. Distinct from `hotspots` (the planted ground
+    truth being evaluated against): this is a literal sequence-divergence
+    signal used only to train the scorer, never the labels it's scored on.
+    """
+    n_residues = len(reference_seq)
+    variant_counts = np.zeros(n_residues, dtype=np.float32)
+    n_compared = 0
+    for rec in records:
+        if rec.sequence == reference_seq:
+            continue
+        n_compared += 1
+        mapping = align_reference_to_query(reference_seq, rec.sequence)
+        for ref_idx, query_idx in mapping.items():
+            if query_idx is None or query_idx >= len(rec.sequence):
+                variant_counts[ref_idx] += 1
+            elif reference_seq[ref_idx] != rec.sequence[query_idx]:
+                variant_counts[ref_idx] += 1
+    if n_compared == 0:
+        return np.zeros(n_residues, dtype=np.float32)
+    return variant_counts / n_compared
 
 
 def autocast_context(use_amp: bool, device: str):
@@ -176,6 +230,8 @@ def evaluate_family(
     alpha: float,
     hops: int,
     top_k: int,
+    scorer: str = "egnn",
+    egnn_config: Optional[Dict] = None,
 ) -> Dict[str, float]:
     fam_records = [r for r in records if r.family == family]
     if not fam_records:
@@ -207,11 +263,34 @@ def evaluate_family(
             variance[idx] = np.var(stack, axis=0).mean()
 
     var_norm = (variance - variance.min()) / (variance.max() - variance.min() + 1e-8)
-    propagated = propagate_scores(var_norm, build_chain_graph(n_residues), alpha=alpha, hops=hops)
+    adj_norm = build_chain_graph(n_residues)
 
     mid_positions = np.array([max(0, n_residues // 3), max(0, n_residues // 2)], dtype=int)
     dist = np.array([min(abs(i - a) for a in mid_positions) for i in range(n_residues)], dtype=np.float32)
     biophysical = (dist - dist.min()) / (dist.max() - dist.min() + 1e-8)
+
+    if scorer == "egnn":
+        from egnn_model import build_edge_index_from_adjacency, straight_chain_coords, train_egnn_ensemble
+
+        edge_index = build_edge_index_from_adjacency(adj_norm)
+        coords = straight_chain_coords(n_residues)
+        position_frac = np.arange(n_residues, dtype=np.float32) / max(1, n_residues - 1)
+        node_features = np.stack([var_norm, biophysical, position_frac], axis=1)
+        target = np.clip(compute_variant_frequency(ref_seq, fam_records), 0.0, 1.0)
+
+        cfg = dict(_DEFAULT_EGNN_CONFIG)
+        if egnn_config:
+            cfg.update(egnn_config)
+        propagated = train_egnn_ensemble(
+            node_features=node_features,
+            coords=coords,
+            edge_index=edge_index,
+            target=target,
+            **cfg,
+        )
+    else:
+        propagated = propagate_scores(var_norm, adj_norm, alpha=alpha, hops=hops)
+
     combined = 0.80 * propagated + 0.20 * biophysical
 
     y_true = np.array([1 if i in hotspots else 0 for i in range(n_residues)], dtype=int)
@@ -220,6 +299,7 @@ def evaluate_family(
 
     metrics = {
         "family": family,
+        "scorer": scorer,
         "n_sequences": len(fam_records),
         "n_hotspots": len(hotspots),
         "roc_auc_variance": float(roc_auc_score(y_true, var_norm)) if 0 < y_true.sum() < len(y_true) else float("nan"),
@@ -246,6 +326,8 @@ def evaluate_dataset(
     alpha: float,
     hops: int,
     top_k: int,
+    scorer: str = "egnn",
+    egnn_config: Optional[Dict] = None,
 ) -> pd.DataFrame:
     records = load_records(fasta_path)
     labels = load_labels(labels_path)
@@ -266,7 +348,7 @@ def evaluate_dataset(
     rows = []
     for fam in families:
         hotspots = labels["families"][fam]["hotspot_positions_0idx"]
-        rows.append(evaluate_family(fam, records, embeddings, hotspots, alpha, hops, top_k))
+        rows.append(evaluate_family(fam, records, embeddings, hotspots, alpha, hops, top_k, scorer, egnn_config))
 
     output_dir.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(rows)
@@ -291,6 +373,9 @@ def main() -> int:
             device = "cpu"
 
     t0 = time.time()
+    print(f"[Scorer] {args.scorer}"
+          + (f" (hidden={args.egnn_hidden}, layers={args.egnn_layers}, ensemble={args.egnn_models})"
+             if args.scorer == "egnn" else ""))
     df = evaluate_dataset(
         fasta_path=args.fasta,
         labels_path=args.labels,
@@ -305,6 +390,14 @@ def main() -> int:
         alpha=args.alpha,
         hops=args.hops,
         top_k=args.top_k,
+        scorer=args.scorer,
+        egnn_config={
+            "n_models": args.egnn_models,
+            "hidden_dim": args.egnn_hidden,
+            "n_layers": args.egnn_layers,
+            "epochs": args.egnn_epochs,
+            "device": device,
+        },
     )
     if args.mock_embeddings:
         print("Synthetic evaluation ran in mock-embedding mode.")
