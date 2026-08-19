@@ -12,6 +12,7 @@ seaborn>=0.11
 
 #Util
 tqdm>=4.60
+requests>=2.31
 
 #Bioinformatics 
 biopython>=1.79
