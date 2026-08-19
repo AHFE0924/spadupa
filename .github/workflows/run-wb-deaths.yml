@@ -1,0 +1,49 @@
+name: Run World Bank deaths pipeline
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  run-wb-deaths:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run World Bank deaths script
+        run: python wb_deaths_by_region.py
+
+      - name: Upload deaths CSV artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wb-deaths-outputs
+          path: |
+            region_deaths_components_2021_2025.csv
+            aggregated_region_deaths_2021_2025.csv
+          if-no-files-found: error
+
+      # Optional: commit generated CSV files back to repository.
+      # Uncomment if your maintainers want generated outputs versioned in git.
+      # - name: Commit generated CSV outputs
+      #   run: |
+      #     git config user.name "github-actions[bot]"
+      #     git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      #     git add region_deaths_components_2021_2025.csv aggregated_region_deaths_2021_2025.csv
+      #     git commit -m "Add updated World Bank deaths outputs" || echo "No changes to commit"
+      #     git push
